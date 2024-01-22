@@ -1,0 +1,365 @@
+n_classes=10
+from tensorflow.keras import layers, models, optimizers
+from    sklearn.cluster import KMeans
+import tensorflow as tf
+from sklearn.metrics import silhouette_score,calinski_harabasz_score,davies_bouldin_score
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+def transformer_block(embedding_dim, num_heads, ff_dim):
+    inputs = layers.Input(shape=(None, embedding_dim))
+    attention = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embedding_dim)(inputs, inputs)
+    attention_output = layers.Add()([attention, inputs])
+    attention_output = layers.BatchNormalization()(attention_output) 
+    attention_output = layers.LayerNormalization()(attention_output)
+    ff_output = layers.Dense(ff_dim, activation="relu")(attention_output)
+    ff_output = layers.Dense(embedding_dim)(ff_output)
+    ff_output = layers.Add()([ff_output, attention_output])
+    output = layers.LayerNormalization()(ff_output)
+    return models.Model(inputs=inputs, outputs=output)
+
+def get_positional_encoding(max_seq_len, embed_dim):
+    positional_encoding = np.zeros((max_seq_len, embed_dim))
+    for pos in range(max_seq_len):
+        for i in range(0, embed_dim, 2):
+            positional_encoding[pos, i] = np.sin(pos / (10000 ** ((2 * i) / embed_dim)))
+            positional_encoding[pos, i + 1] = np.cos(pos / (10000 ** ((2 * i) / embed_dim)))
+    return positional_encoding
+
+
+def create_encoder(behavior_size, embedding_size, output_size, unique_behaviors, unique_items, unique_categories):
+    encoder_inputs = layers.Input(shape=(behavior_size, 3))
+    behavior_input, item_input, cate_input = encoder_inputs[:, :, 0], encoder_inputs[:, :, 1], encoder_inputs[:, :, 2]
+    behavior_embedding = layers.Embedding(input_dim=unique_behaviors, output_dim=embedding_size, input_length=behavior_size, mask_zero=True)(behavior_input)
+    item_embedding = layers.Embedding(input_dim=unique_items, output_dim=embedding_size, input_length=behavior_size, mask_zero=True)(item_input)
+    cate_embedding = layers.Embedding(input_dim=unique_categories, output_dim=embedding_size, input_length=behavior_size, mask_zero=True)(cate_input)
+    positional_encoding = get_positional_encoding(behavior_size, embedding_size)
+    behavior_embedding += positional_encoding
+    item_embedding += positional_encoding
+    cate_embedding += positional_encoding  
+    embedding = layers.concatenate([behavior_embedding, item_embedding, cate_embedding], axis=-1)
+    transformer = transformer_block(embedding_dim=embedding_size * 3, num_heads=4, ff_dim=32)
+    x = transformer(embedding)
+    encoder_outputs = layers.Flatten()(x)
+    encoder_outputs = layers.Dense(output_size)(encoder_outputs)
+    encoder_outputs=layers.Activation('tanh')(encoder_outputs)
+    encoder_model = models.Model(inputs=encoder_inputs, outputs=encoder_outputs)
+    item_embedding_model = models.Model(inputs=encoder_inputs, outputs=item_embedding)
+    return encoder_model, item_embedding_model
+
+def create_decoder(behavior_size, hidden_layer_size, unique_behaviors, unique_items, unique_categories):
+    decoder_inputs = layers.Input(shape=(hidden_layer_size,))
+    x = layers.RepeatVector(behavior_size)(decoder_inputs)
+    positional_encoding = get_positional_encoding(behavior_size, hidden_layer_size)
+    x += positional_encoding
+    transformer = transformer_block(embedding_dim=hidden_layer_size, num_heads=4, ff_dim=32)
+    x = transformer(x)
+    behavior_out = layers.Dense(unique_behaviors, activation='softmax')(x)
+    item_out = layers.Dense(unique_items, activation='softmax')(x)
+    cate_out = layers.Dense(unique_categories, activation='softmax')(x)
+    decoder_model = models.Model(inputs=decoder_inputs, outputs=[behavior_out, item_out, cate_out])
+    return decoder_model
+
+def create_autoencoder(encoder_model, decoder_model, behavior_size):
+    encoder_inputs = layers.Input(shape=(behavior_size, 3))
+    encoder_outputs = encoder_model(encoder_inputs)
+    decoder_outputs = decoder_model(encoder_outputs)
+    autoencoder_model = models.Model(inputs=encoder_inputs, outputs=decoder_outputs)
+    return autoencoder_model
+
+adam = optimizers.Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-07)
+encoder_model, item_embedding_model = create_encoder(behavior_size, embedding_size, output_size, len(np.unique(data[:,:,0])), len(np.unique(data[:,:,1])), len(np.unique(data[:,:,2])))
+decoder_model = create_decoder(behavior_size, output_size, len(np.unique(data[:,:,0])), len(np.unique(data[:,:,1])), len(np.unique(data[:,:,2])))
+autoencoder_model = create_autoencoder(encoder_model, decoder_model, behavior_size)      
+autoencoder_model.compile(optimizer=adam, loss='sparse_categorical_crossentropy', loss_weights=[1,1,1], metrics=['accuracy'])
+kmeans = KMeans(n_clusters=n_classes, n_init=20)
+def re_loss(item_true, item_pred):
+    item_true=tf.cast(item_true,tf.float32)
+    item_pred=tf.cast(item_pred,tf.float32)
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False)
+    loss_value = loss_fn(item_true, item_pred)
+    return loss_value
+
+def extract_features(sequence, num_behaviors, num_categories, num_products):
+    sequence = tf.cast(sequence, dtype=tf.int32)
+    behavior_freq = tf.math.bincount(sequence[:, 0], minlength=num_behaviors, maxlength=num_behaviors, dtype=tf.float32)
+    category_freq = tf.math.bincount(sequence[:, 1], minlength=num_categories, maxlength=num_categories, dtype=tf.float32)
+    product_freq = tf.math.bincount(sequence[:, 2], minlength=num_products, maxlength=num_products, dtype=tf.float32)
+    behavior_freq = behavior_freq / tf.reduce_sum(behavior_freq)
+    category_freq = category_freq / tf.reduce_sum(category_freq)
+    product_freq = product_freq / tf.reduce_sum(product_freq)
+    return tf.concat([behavior_freq, category_freq, product_freq], axis=0)
+def preference_loss(sequence1, sequence2, num_behaviors, num_categories, num_products):
+    features1 = extract_features(sequence1, num_behaviors, num_categories, num_products)
+    features2 = extract_features(sequence2, num_behaviors, num_categories, num_products)
+    return tf.norm(features1 - features2)
+
+def custom_loss(behavior_pred, behavior_true, item_pred, item_true, cate_pred, cate_true, encoded, cluster_centers, alpha=1,beta=1, outlier_threshold=10):
+    behavior_loss = re_loss(behavior_true, behavior_pred)
+    item_loss = re_loss(item_true, item_pred)
+    cate_loss = re_loss(cate_true, cate_pred)
+    encoded_np = np.array(encoded)
+    cluster_assignments = kmeans.predict(encoded_np)
+    cluster_assignments = tf.cast(cluster_assignments, tf.int32)
+    cluster_centers = tf.convert_to_tensor(cluster_centers, dtype=tf.float32)
+    difference = encoded - tf.gather(cluster_centers, cluster_assignments)
+    distances = tf.norm(difference, axis=1)
+    mask = distances < outlier_threshold
+    filtered_distances = tf.boolean_mask(distances, mask)
+    clustering_loss = tf.reduce_mean(filtered_distances)
+    pred = tf.stack([tf.argmax(behavior_pred, axis=2), tf.argmax(cate_pred, axis=2), tf.argmax(item_pred, axis=2)], axis=2)
+    true=tf.stack([behavior_true,cate_true,item_true],axis=2)
+    prefer_loss=preference_loss(pred,true,len(np.unique(data[:,:,0])),len(np.unique(data[:,:,2])),len(np.unique(data[:,:,1])))
+    return (behavior_loss + item_loss + cate_loss) + alpha * clustering_loss + beta * prefer_loss
+
+def remove_outliers(encoded_data, cluster_predictions, threshold=10):
+        distances = np.linalg.norm(encoded_data - kmeans.cluster_centers_[cluster_predictions], axis=1)
+        mask = distances < threshold
+        return encoded_data[mask], cluster_predictions[mask]
+
+epoch=50
+batch_size=32
+verbose=1
+autoencoder_model.fit(data, [decoder_behavior,decoder_product,decoder_category], epochs=epoch, batch_size=batch_size, verbose=verbose,validation_split=0.1)
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-07)
+batch_size = 32
+s1=[]
+s2=[]
+for epoch in range(100):
+    encoded_v=[]
+    for i in range(0, len(data), batch_size):
+        x_batch = data[i:i+batch_size]
+        encoded=encoder_model.predict(x_batch)
+        encoded=np.array(encoded)
+        encoded_v.append(encoded)
+    encoded_v=np.concatenate(encoded_v,axis=0)
+    kmeans.fit(encoded_v)
+    for i in range(0, len(data), batch_size):
+        x_batch = data[i:i+batch_size]
+        behavior_batch = decoder_behavior[i:i+batch_size]
+        product_batch = decoder_product[i:i+batch_size]
+        category_batch = decoder_category[i:i+batch_size]
+        with tf.GradientTape() as tape:
+            reconstructed_behavior,reconstructed_product,reconstructed_category = autoencoder_model(x_batch)
+            encoded_v= encoder_model(x_batch)
+            loss = custom_loss(reconstructed_behavior,behavior_batch,reconstructed_product,product_batch,reconstructed_category,category_batch,encoded_v,kmeans.cluster_centers_)
+        gradients = tape.gradient(loss, autoencoder_model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, autoencoder_model.trainable_variables))
+    
+    if epoch % 1 == 0:
+        print(f'Epoch {epoch},Loss: {loss.numpy()}')
+
+    if epoch % 1 == 0: 
+        encoded_v = []
+        try:
+            for i in range(0, len(data), batch_size):
+                x_batch = data[i:i + batch_size]
+                encoded = encoder_model.predict(x_batch)
+                encoded = np.array(encoded)
+                encoded_v.append(encoded)
+            encoded_v = np.concatenate(encoded_v, axis=0)
+
+            cluster_predictions = kmeans.predict(encoded_v)
+            filtered_encoded_v, filtered_predictions = remove_outliers(encoded_v, cluster_predictions)
+            ss = silhouette_score(filtered_encoded_v, filtered_predictions)
+            ch = calinski_harabasz_score(filtered_encoded_v, filtered_predictions)
+            s1.append(ss)
+            s2.append(ch)
+            print('Silhouette Score:', ss, 'Calinski Harabasz Score:', ch)
+        except Exception as e:
+            print('An error occurred:', e)
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+from prefixspan import PrefixSpan
+
+def plot_patterns_by_class(n_classes, df2, labels):
+    patterns_by_class = {} 
+
+    for label in range(n_classes):
+        data0 = df2[labels == label]
+        data = pd.DataFrame(data0[:, :, 5]).astype(str)
+        data = data.values.tolist()
+        data = [list(filter(lambda x: x != '0', i)) for i in data]
+        data = [[s.split('.', 1)[1] if '.' in s else s for s in sublist] for sublist in data]
+        ps = PrefixSpan(data)
+        min_support = len(data0) // 3
+        patterns_by_class[label] = set(tuple(pattern[1]) for pattern in ps.frequent(min_support))
+
+ 
+    common_patterns = set.intersection(*patterns_by_class.values())
+
+
+    for label in patterns_by_class:
+        patterns_by_class[label] -= common_patterns
+
+
+
+    num_rows = (n_classes + 1) // 2
+    fig, axs = plt.subplots(num_rows, 2, figsize=(12, 15))
+
+    for label, patterns in patterns_by_class.items():
+        ax = axs[label // 2, label % 2]
+        ax.spines['top'].set_color('black')
+        ax.spines['bottom'].set_color('black')
+        ax.spines['left'].set_color('black')
+        ax.spines['right'].set_color('black')
+
+      
+        G = nx.DiGraph()
+        G.add_node("Start")
+        for pattern in patterns:
+     
+            for i in range(len(pattern) - 1):
+                source = pattern[i]
+                target = pattern[i + 1]
+                G.add_edge(source, target)
+            G.add_edge("Start", pattern[0])
+
+    
+        pos = nx.circular_layout(G)
+        nx.draw_networkx_nodes(G, pos, node_color='skyblue', node_size=500, ax=ax)
+        nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, width=1.5, arrowstyle='-|>', ax=ax)
+        nx.draw_networkx_labels(G, pos, font_size=10, ax=ax)
+
+        ax.set_title(f'Label {label}')
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+plot_patterns_by_class(n_classes, df2, labels)
+
+def calculate_item_embedding():
+    item_id_list = np.arange(0, len(np.unique(data[:, :, 1])))
+    item_id_list = np.pad(item_id_list, (0, 200 - len(item_id_list) % 200), 'constant')
+    item_id_list = item_id_list.reshape(-1, 200)
+    item_id_list = np.repeat(item_id_list, 3, axis=1)
+    item_id_list = item_id_list.reshape(-1, 200, 3)
+    item_embedding = item_embedding_model.predict(item_id_list)
+    item_embedding = item_embedding.reshape(-1, embedding_size)
+    item_embedding = item_embedding[:len(np.unique(data[:, :, 1])), :]
+    return item_embedding
+item_embedding=calculate_item_embedding()   
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn import metrics
+from imblearn.over_sampling import SMOTE
+from sklearn.utils import shuffle
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+def calculate_item_embedding():
+    item_id_list = np.arange(0, len(np.unique(data[:, :, 1])))
+    item_id_list = np.pad(item_id_list, (0, 200 - len(item_id_list) % 200), 'constant')
+    item_id_list = item_id_list.reshape(-1, 200)
+    item_id_list = np.repeat(item_id_list, 3, axis=1)
+    item_id_list = item_id_list.reshape(-1, 200, 3)
+    item_embedding = item_embedding_model.predict(item_id_list)
+    item_embedding = item_embedding.reshape(-1, embedding_size)
+    item_embedding = item_embedding[:len(np.unique(data[:, :, 1])), :]
+    return item_embedding
+
+def filter_data(classes=0):
+    data0 = data[labels == classes]
+    data0 = data0[(data0[:,:,0] == 1) | (data0[:,:,0] == 2)]
+    data0 = data0[:, 1]
+    data0 = np.unique(data0)
+    data1 = data[labels == 0]
+    data1 = data1[data1[:,:,0] == 3]
+    data1 = data1[:, 1]
+    data1 = np.unique(data1)
+    data1 = np.setdiff1d(data1, data0)
+    return data0, data1
+
+def NML_dataset(inter, uninter):
+    inter_embedding = item_embedding[inter]
+    uninter_embedding = item_embedding[uninter]
+    NML_x = np.concatenate([inter_embedding, uninter_embedding], axis=0)
+    NML_y = np.concatenate([np.ones(len(inter_embedding)), np.zeros(len(uninter_embedding))], axis=0)
+    NML_x = np.where(NML_x > 0, 1, 0)
+    smo = SMOTE(k_neighbors=1,random_state=0)
+    NML_x, NML_y = smo.fit_resample(NML_x, NML_y)
+    NML_x, NML_y = shuffle(NML_x, NML_y, random_state=rand_seed)  
+    return NML_x, NML_y
+
+def NML_model(NML_x, NML_y):
+    NML_x_train, NML_x_test, NML_y_train, NML_y_test = train_test_split(NML_x, NML_y, test_size=0.2, random_state=rand_seed)
+    logisticRegr = LogisticRegression()
+    logisticRegr.fit(NML_x_train, NML_y_train)
+    NML_y_pred = logisticRegr.predict(NML_x_test)
+    return logisticRegr
+
+def get_feature():
+    feature = np.zeros((2**16, 16))
+    for i in range(2**16):
+        for j in range(16):
+            feature[i, j] = (i >> j) & 1
+    return feature
+            
+def select_optical_attribute(NML_m):
+    combinations = get_feature()
+    results = NML_m.predict_proba(combinations)[:, 1]
+    index = np.argmax(results)
+    optical_attribute = combinations[index]
+    return optical_attribute
+
+def process_data_and_select_attribute(classes=0):
+    inter, uninter = filter_data(classes)
+    NML_x, NML_y = NML_dataset(inter, uninter)
+    NML_m = NML_model(NML_x, NML_y)
+    optical_attribute = select_optical_attribute(NML_m)
+    return optical_attribute
+
+item_embedding=calculate_item_embedding()   
+
+optical_attribute_list2 = []
+for i in range(10):
+    optical_attribute_list = []
+    rand_seed=i   
+    for i in range(n_classes):
+        optical_attribute_list.append(process_data_and_select_attribute(i))
+    optical_attribute_list=np.array(optical_attribute_list)
+    optical_attribute_list2.append(optical_attribute_list)
+optical_attribute_list=np.mean(optical_attribute_list2,axis=0)
+
+tsne = TSNE(n_components=2, init='pca', random_state=0,learning_rate=100)
+X_tsne = tsne.fit_transform(optical_attribute_list)
+scaler = StandardScaler()
+X_tsne = scaler.fit_transform(X_tsne)
+plt.figure(figsize=(6, 4))
+plt.scatter(X_tsne[:, 0], X_tsne[:, 1], marker='X', color='black')
+for i in range(n_classes):
+    plt.annotate("Cluster " + str(i), xy=(X_tsne[i, 0], X_tsne[i, 1]), xytext=(X_tsne[i, 0], X_tsne[i, 1]+0.1))
+plt.xlim(X_tsne[:, 0].min() - 1, X_tsne[:, 0].max() + 1)  
+plt.ylim(X_tsne[:, 1].min() - 1, X_tsne[:, 1].max() + 1) 
+plt.title('Attribute Preference of Each Cluster')
+plt.show()
+    
+
+import numpy as np
+def calculate_total_p(data, labels, optical_attribute_list):
+    user_p = []
+    for i in range(n_classes):
+        user_i = data[labels == i]
+        user_i_P = []
+        for j in range(len(user_i)):
+            user_j = user_i[j]
+            user_view = user_j[user_j[:, 0] == 3][:, 1]
+            user_unview = user_j[(user_j[:, 0] == 1) | (user_j[:, 0] == 1)][:, 1]
+            try:
+                user_x, user_y = NML_dataset(user_view, user_unview)
+                user_m = NML_model(user_x, user_y)
+                user_P = user_m.predict_proba(optical_attribute_list[0:1, ])[:, 1]
+                user_i_P.append(user_P)
+            except:
+                user_i_P.append(np.array([0]))
+        user_i_P = np.array(user_i_P)
+        user_p.append(user_i_P)
+    total_p = np.mean(np.concatenate(user_p, axis=0))
+    return total_p
+
+total_p = calculate_total_p(data, labels, optical_attribute_list)
+print('buy_rate = {:.3f}'.format(total_p))
